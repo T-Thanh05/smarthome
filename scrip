@@ -1,0 +1,486 @@
+const socket = io(); 
+let currentLang = 'vi';
+let localDevices = []; 
+let currentUser = null; 
+let scheduledTasks = []; // Mảng chứa danh sách hẹn giờ
+
+// Trạng thái tổng quan để hiển thị lên thanh Quick Stats
+let dashboardStats = {
+    totalDevices: 0,
+    totalDoors: 0,
+    totalLights: 0,
+    doorsOpen: 0,
+    lightsOn: 0,
+    lastTemp: null,
+    lastHum: null,
+    lastGas: null,
+    lastUpdateText: 'Chưa có dữ liệu thời gian thực'
+};
+
+function renderQuickStats() {
+    const totalEl = document.getElementById('stat-total-devices');
+    const totalBd = document.getElementById('stat-total-breakdown');
+    const liveState = document.getElementById('stat-live-state');
+    const liveSub = document.getElementById('stat-live-sub');
+    const tempEl = document.getElementById('stat-temp');
+    const humEl = document.getElementById('stat-hum');
+    const gasEl = document.getElementById('stat-gas');
+    const lastUpd = document.getElementById('stat-last-update');
+
+    if (!totalEl) return; 
+
+    totalEl.textContent = dashboardStats.totalDevices.toString();
+    totalBd.textContent = `Cửa: ${dashboardStats.totalDoors} • Đèn: ${dashboardStats.totalLights}`;
+
+    const hasActivity = dashboardStats.lightsOn > 0 || dashboardStats.doorsOpen > 0;
+    liveState.textContent = hasActivity ? 'Đang hoạt động' : 'Trạng thái tiết kiệm';
+    liveSub.textContent = `Đèn bật: ${dashboardStats.lightsOn} • Cửa mở: ${dashboardStats.doorsOpen}`;
+
+    tempEl.textContent = (dashboardStats.lastTemp !== null ? dashboardStats.lastTemp + '°C' : '--°C');
+    humEl.textContent = (dashboardStats.lastHum !== null ? dashboardStats.lastHum + '%' : '--%');
+    gasEl.textContent = dashboardStats.lastGas || '--';
+    lastUpd.textContent = dashboardStats.lastUpdateText;
+}
+
+function toggleAuth(formName) {
+    document.getElementById('formLogin').style.display = formName === 'login' ? 'block' : 'none';
+    document.getElementById('formRegister').style.display = formName === 'register' ? 'block' : 'none';
+    document.getElementById('formForgot').style.display = formName === 'forgot' ? 'block' : 'none';
+    document.querySelectorAll('.msg-text').forEach(el => el.style.display = 'none');
+}
+
+function showMsg(elementId, text, isSuccess) {
+    const el = document.getElementById(elementId);
+    el.style.display = 'block';
+    el.textContent = text;
+    el.className = isSuccess ? 'msg-text text-success' : 'msg-text text-danger';
+}
+
+function checkAuth() {
+    const savedUser = localStorage.getItem('smartHomeUser');
+    if (savedUser) {
+        currentUser = JSON.parse(savedUser);
+        document.getElementById('loginScreen').style.display = 'none';
+        document.getElementById('appContainer').style.display = 'block';
+        document.getElementById('displayUsername').textContent = currentUser.username;
+        
+        const userRole = (currentUser.role || '').toLowerCase();
+        document.getElementById('displayRole').textContent = userRole === 'admin' ? 'Quản trị viên' : 'Người dùng';
+        
+        if (userRole === 'user') {
+            document.getElementById('addDeviceBtn').style.display = 'none';
+            document.getElementById('menuManageUsersLi').style.display = 'none';
+        } else {
+            document.getElementById('addDeviceBtn').style.display = 'flex';
+            document.getElementById('menuManageUsersLi').style.display = 'block';
+        }
+        fetchDevices();
+    } else {
+        document.getElementById('loginScreen').style.display = 'flex';
+        document.getElementById('appContainer').style.display = 'none';
+        toggleAuth('login');
+    }
+}
+
+async function submitLogin() {
+    const userInp = document.getElementById('loginUsername').value.trim();
+    const passInp = document.getElementById('loginPassword').value.trim();
+    if(!userInp || !passInp) return showMsg('loginMsg', 'Vui lòng điền đủ thông tin!', false);
+    try {
+        const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: userInp, password: passInp }) });
+        const data = await res.json();
+        if (data.success) {
+            localStorage.setItem('smartHomeUser', JSON.stringify(data.user));
+            checkAuth();
+        } else showMsg('loginMsg', data.message, false);
+    } catch (e) { showMsg('loginMsg', 'Lỗi kết nối máy chủ!', false); }
+}
+
+async function submitRegister() {
+    const user = document.getElementById('regUsername').value.trim();
+    const pass = document.getElementById('regPassword').value.trim();
+    const rePass = document.getElementById('regRePassword').value.trim();
+    if(!user || !pass) return showMsg('regMsg', 'Vui lòng nhập đủ thông tin!', false);
+    if(pass !== rePass) return showMsg('regMsg', 'Mật khẩu nhập lại không khớp!', false);
+    try {
+        const res = await fetch('/api/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: user, password: pass }) });
+        const data = await res.json();
+        if (data.success) { alert("Đăng ký thành công!"); toggleAuth('login'); }
+        else showMsg('regMsg', data.message, false);
+    } catch (e) { showMsg('regMsg', 'Lỗi kết nối máy chủ!', false); }
+}
+
+async function submitForgot() {
+    const user = document.getElementById('forgotUsername').value.trim();
+    const newPass = document.getElementById('forgotNewPassword').value.trim();
+    if(!user || !newPass) return showMsg('forgotMsg', 'Nhập đủ thông tin!', false);
+    try {
+        const res = await fetch('/api/forgot-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: user, newPassword: newPass }) });
+        const data = await res.json();
+        if (data.success) { alert("Đặt lại mật khẩu thành công!"); toggleAuth('login'); }
+        else showMsg('forgotMsg', data.message, false);
+    } catch (e) { showMsg('forgotMsg', 'Lỗi kết nối!', false); }
+}
+
+async function submitChangePass() {
+    const oldPass = document.getElementById('changeOldPass').value.trim();
+    const newPass = document.getElementById('changeNewPass').value.trim();
+    if(!oldPass || !newPass) return showMsg('changePassMsg', 'Vui lòng điền đủ thông tin!', false);
+    try {
+        const res = await fetch('/api/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: currentUser.username, oldPassword: oldPass, newPassword: newPass }) });
+        const data = await res.json();
+        if (data.success) {
+            showMsg('changePassMsg', data.message, true);
+            setTimeout(() => { alert("Vui lòng đăng nhập lại!"); logout(); }, 1500);
+        } else showMsg('changePassMsg', data.message, false);
+    } catch (e) { showMsg('changePassMsg', 'Lỗi kết nối!', false); }
+}
+
+function logout() { localStorage.removeItem('smartHomeUser'); location.reload(); }
+
+async function fetchUsers() {
+    if (!currentUser) return;
+    const userRole = (currentUser.role || '').toLowerCase();
+    if (userRole !== 'admin') return;
+    
+    try {
+        const res = await fetch('/api/users');
+        const users = await res.json();
+        const container = document.getElementById('usersListContainer');
+        container.innerHTML = '';
+        
+        users.forEach(u => {
+            const rowRole = (u.role || '').toLowerCase();
+            const isAdmin = rowRole === 'admin' ? 'selected' : '';
+            const isUser = rowRole === 'user' ? 'selected' : '';
+            const isSuperAdmin = u.username.toLowerCase() === 'admin';
+            const disableSelf = (u.username === currentUser.username || isSuperAdmin) ? 'disabled' : '';
+            
+            let badges = '';
+            if (u.username === currentUser.username) badges += '<span style="font-size:10px; background:var(--primary); color:white; padding:2px 6px; border-radius:10px; margin-left:5px;">Bạn</span>';
+            if (isSuperAdmin) badges += '<span title="Quản trị viên tối cao" style="font-size:10px; background:#e74c3c; color:white; padding:2px 6px; border-radius:10px; margin-left:5px;"><i class="fas fa-crown"></i> Gốc</span>';
+            
+            container.innerHTML += `
+                <div style="background: rgba(128,128,128,0.1); padding: 15px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; border: 1px solid rgba(128,128,128,0.1);">
+                    <div style="font-weight: bold; color: var(--text-main); display:flex; align-items:center;">
+                        <i class="fas fa-user-circle" style="margin-right:10px; font-size:24px; color:#95a5a6;"></i> 
+                        ${u.username} ${badges}
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <select onchange="changeUserRole(${u.id}, this.value)" style="padding:8px; border-radius:8px; font-size:13px; border:1px solid rgba(128,128,128,0.3); background: rgba(255,255,255,0.5);" ${disableSelf}>
+                            <option value="user" ${isUser}>User</option>
+                            <option value="admin" ${isAdmin}>Admin</option>
+                        </select>
+                        <button class="btn-delete" onclick="deleteUser(${u.id})" style="padding:8px 12px; background:var(--danger); color:white; border-radius:8px;" ${disableSelf}><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
+            `;
+        });
+    } catch (e) { console.error("Lỗi fetchUsers:", e); }
+}
+
+async function changeUserRole(id, newRole) {
+    if(confirm("Xác nhận đổi quyền?")) {
+        const res = await fetch(`/api/users/${id}/role`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: newRole }) });
+        const data = await res.json();
+        if(!data.success && data.message) alert(data.message); 
+    }
+    fetchUsers();
+}
+
+async function deleteUser(id) {
+    if(confirm("Xóa tài khoản này?")) { 
+        const res = await fetch(`/api/users/${id}`, { method: 'DELETE' }); 
+        const data = await res.json();
+        if(!data.success && data.message) alert(data.message); 
+        fetchUsers(); 
+    }
+}
+
+async function fetchDevices() {
+    if (!currentUser) return;
+    const response = await fetch('/api/devices');
+    localDevices = await response.json();
+    renderDevices();
+}
+
+function renderDevices() {
+    const dc = document.getElementById('doors-container');
+    const lc = document.getElementById('lights-container');
+    if(!dc || !lc) return;
+    
+    dc.innerHTML = ''; lc.innerHTML = '';
+    const userRole = (currentUser.role || '').toLowerCase();
+    const deleteBtnHtml = userRole === 'admin' ? `<button onclick="deleteDevice('{id}')" class="btn-delete" title="Xóa thiết bị"><i class="fas fa-trash"></i></button>` : '';
+
+    dashboardStats.totalDevices = localDevices.length;
+    dashboardStats.totalDoors = 0;
+    dashboardStats.totalLights = 0;
+    dashboardStats.doorsOpen = 0;
+    dashboardStats.lightsOn = 0;
+
+    localDevices.forEach(dev => {
+        const btnXoa = deleteBtnHtml.replace('{id}', dev.id);
+        if (dev.type === 'door') {
+            dashboardStats.totalDoors += 1;
+            const isOpen = (dev.state === 'OPEN');
+            if (isOpen) dashboardStats.doorsOpen += 1;
+            const btnClass = isOpen ? 'open' : 'closed';
+            dc.innerHTML += `<div class="device">
+                <span>${dev.name}</span>
+                <div class="device-controls">
+                    <button onclick="toggleDoor('${dev.id}', '${dev.state}')" class="btn-door ${btnClass}">
+                        ${isOpen ? 'Mở' : 'Đóng'}
+                    </button>
+                    ${btnXoa}
+                </div>
+            </div>`;
+        } else if (dev.type === 'light') {
+            dashboardStats.totalLights += 1;
+            const isChecked = dev.state === 'ON';
+            if (isChecked) dashboardStats.lightsOn += 1;
+            lc.innerHTML += `<div class="device">
+                <span>${dev.name}</span>
+                <div class="device-controls">
+                    <label class="switch">
+                        <input type="checkbox" onchange="toggleLight('${dev.id}', '${dev.state}')" ${isChecked ? 'checked' : ''}>
+                        <span class="slider"></span>
+                    </label>
+                    ${btnXoa}
+                </div>
+            </div>`;
+        }
+    });
+
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+        if(dictionary[currentLang] && dictionary[currentLang][el.getAttribute('data-i18n')]) {
+            el.textContent = dictionary[currentLang][el.getAttribute('data-i18n')];
+        }
+    });
+
+    renderQuickStats();
+}
+
+// Hàm toggleDoor ĐÃ FIX CHUẨN XÁC
+function toggleDoor(id, st) { 
+    const newState = st === 'OPEN' ? 'CLOSED' : 'OPEN';
+    socket.emit('toggle_device', { 
+        id: id,
+        state: newState
+    }); 
+}
+
+function toggleLight(id, currentSt) { 
+    const newState = (currentSt === 'ON') ? 'OFF' : 'ON';
+    socket.emit('toggle_device', { id: id, state: newState }); 
+}
+
+async function deleteDevice(id) { 
+    if(confirm("Xóa thiết bị này?")) {
+        await fetch(`/api/devices/${id}`, { method: 'DELETE' }); 
+        fetchDevices(); 
+    }
+}
+
+async function submitNewDevice() {
+    const name = document.getElementById('newDevName').value.trim();
+    const type = document.getElementById('newDevType').value;
+    if(!name) return;
+    await fetch('/api/devices', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
+    document.getElementById('addModal').classList.remove('active');
+    document.getElementById('newDevName').value = ''; 
+    fetchDevices(); 
+}
+
+// --- NGỮ CẢNH ---
+function activateScene(sceneType) {
+    localDevices.forEach(dev => {
+        if (sceneType === 'leave' || sceneType === 'sleep') {
+            const newState = (dev.type === 'door' ? 'CLOSED' : 'OFF');
+            socket.emit('toggle_device', { id: dev.id, state: newState });
+        }
+    });
+    alert("Đã kích hoạt ngữ cảnh thành công!");
+    switchTab('dashboard');
+}
+
+// --- HẸN GIỜ ---
+function saveSchedule() {
+    const devId = document.getElementById('scheduleDevice').value;
+    const time = document.getElementById('scheduleTime').value; 
+    let action = document.getElementById('scheduleAction').value;
+    
+    if(!devId || !time) {
+        alert("Vui lòng nhập đủ thiết bị và thời gian!");
+        return;
+    }
+    
+    const device = localDevices.find(d => d.id === devId);
+    if(device && device.type === 'door') {
+        if(action === 'ON') action = 'OPEN';
+        if(action === 'OFF') action = 'CLOSED';
+    }
+
+    scheduledTasks.push({ devId, time, action, executed: false });
+    alert(`Đã đặt lịch hẹn giờ thành công lúc ${time}`);
+    
+    document.getElementById('scheduleTime').value = ''; 
+    switchTab('dashboard'); 
+}
+
+// BỘ ĐẾM HẸN GIỜ
+setInterval(() => {
+    if(scheduledTasks.length === 0) return;
+    
+    const now = new Date();
+    const currentHours = now.getHours().toString().padStart(2, '0');
+    const currentMinutes = now.getMinutes().toString().padStart(2, '0');
+    const currentTime = `${currentHours}:${currentMinutes}`;
+    
+    scheduledTasks.forEach(task => {
+        if(task.time === currentTime && now.getSeconds() === 0 && !task.executed) {
+            console.log("Kích hoạt lịch hẹn:", task);
+            socket.emit('toggle_device', { id: task.devId, state: task.action });
+            task.executed = true; 
+        }
+    });
+    
+    scheduledTasks = scheduledTasks.filter(task => !task.executed);
+}, 1000);
+
+// ==========================================
+// LOGIC CHUYỂN TAB 
+// ==========================================
+function switchTab(tabId) {
+    document.querySelectorAll('.tab-content').forEach(tab => {
+        tab.style.display = 'none';
+    });
+
+    const targetTab = document.getElementById('tab-' + tabId);
+    if(targetTab) {
+        targetTab.style.display = 'block';
+    }
+
+    document.querySelectorAll('.menu-links a').forEach(link => link.classList.remove('active'));
+    const activeLink = document.getElementById('menu-' + tabId);
+    if(activeLink) activeLink.classList.add('active');
+
+    closeMenu();
+
+    if(tabId === 'history') {
+        loadHistoryData();
+    } 
+    else if (tabId === 'schedule') {
+        const selectDev = document.getElementById('scheduleDevice');
+        selectDev.innerHTML = '';
+        if (localDevices.length === 0) {
+            selectDev.innerHTML = `<option value="">Chưa có thiết bị nào</option>`;
+        } else {
+            localDevices.forEach(dev => { 
+                selectDev.innerHTML += `<option value="${dev.id}">${dev.name}</option>`; 
+            });
+        }
+    }
+    else if (tabId === 'users') {
+        fetchUsers();
+    }
+}
+
+// --- LOGIC LẤY LỊCH SỬ CẢM BIẾN ---
+async function loadHistoryData() {
+    const tbody = document.getElementById('history-table-body');
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 20px;">Đang tải dữ liệu từ MySQL... <i class="fas fa-spinner fa-spin"></i></td></tr>';
+
+    try {
+        const response = await fetch('/api/history');
+        const data = await response.json();
+        
+        tbody.innerHTML = '';
+        if(data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; padding: 20px;">Chưa có dữ liệu nào được ghi nhận.</td></tr>';
+            return;
+        }
+
+        data.forEach(row => {
+            const dateObj = new Date(row.timestamp);
+            const timeString = dateObj.toLocaleString('vi-VN');
+            
+            let icon = ''; let unit = '';
+            if(row.sensor_type === 'temperature') { icon = '<span style="color:#ff3333"><i class="fas fa-temperature-half"></i> Nhiệt độ</span>'; unit = '°C'; }
+            if(row.sensor_type === 'humidity') { icon = '<span style="color:#0088cc"><i class="fas fa-droplet"></i> Độ ẩm</span>'; unit = '%'; }
+            if(row.sensor_type === 'gas') { icon = '<span style="color:#ff7300"><i class="fas fa-fire"></i> Khí Gas</span>'; unit = ''; }
+
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td style="padding: 12px; border-bottom: 1px solid rgba(128,128,128,0.1);">#${row.id}</td>
+                <td style="padding: 12px; border-bottom: 1px solid rgba(128,128,128,0.1); font-weight: bold;">${icon}</td>
+                <td style="padding: 12px; border-bottom: 1px solid rgba(128,128,128,0.1); color: var(--primary); font-weight: bold;">${row.value} ${unit}</td>
+                <td style="padding: 12px; border-bottom: 1px solid rgba(128,128,128,0.1); font-size: 13px; color: var(--text-sub);">${timeString}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    } catch (error) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: red; padding: 20px;">Lỗi kết nối Cơ sở dữ liệu!</td></tr>';
+    }
+}
+
+
+// --- GIAO DIỆN CHUNG & MENU ---
+document.getElementById('langToggle').addEventListener('click', () => { 
+    currentLang = currentLang === 'vi' ? 'en' : 'vi'; 
+    renderDevices(); 
+});
+document.getElementById('themeToggle').addEventListener('click', () => { document.body.classList.toggle('dark-mode'); });
+const sideMenu = document.getElementById('sideMenu');
+const menuOverlay = document.getElementById('menuOverlay');
+
+function openMenu() { sideMenu.classList.add('active'); menuOverlay.classList.add('active'); }
+function closeMenu() { sideMenu.classList.remove('active'); menuOverlay.classList.remove('active'); }
+document.getElementById('menuToggle').addEventListener('click', openMenu);
+document.getElementById('closeMenuBtn').addEventListener('click', closeMenu);
+menuOverlay.addEventListener('click', closeMenu);
+
+// Socket Events
+socket.on('device_list_updated', () => { fetchDevices(); });
+socket.on('device_updated', (data) => { 
+    const d = localDevices.find(x => x.id === data.id); 
+    if(d) { d.state = data.state; renderDevices(); } 
+});
+
+socket.on('sensor_update', (data) => {
+    if (data.type === 'humidity') {
+        const humEl = document.getElementById('val-humidity');
+        if (humEl) humEl.textContent = data.value + '%';
+        dashboardStats.lastHum = data.value;
+    } 
+    else if (data.type === 'temperature') {
+        const tempEl = document.getElementById('val-temperature');
+        if (tempEl) tempEl.textContent = data.value + '°C';
+        dashboardStats.lastTemp = data.value;
+    } 
+    else if (data.type === 'gas') {
+        const gasEl = document.getElementById('val-gas');
+        if (gasEl) {
+            if (data.value === 'DANGER') {
+                const dangerText = dictionary[currentLang]['danger'] || 'Nguy hiểm';
+                gasEl.textContent = dangerText;
+                gasEl.className = 'sensor-val text-danger';
+                dashboardStats.lastGas = dangerText;
+            } else {
+                const safeText = dictionary[currentLang]['safe'] || 'An toàn';
+                gasEl.textContent = safeText;
+                gasEl.className = 'sensor-val safe';
+                dashboardStats.lastGas = safeText;
+            }
+        }
+    }
+
+    const now = new Date();
+    const hh = now.getHours().toString().padStart(2, '0');
+    const mm = now.getMinutes().toString().padStart(2, '0');
+    dashboardStats.lastUpdateText = `Cập nhật gần nhất lúc ${hh}:${mm}`;
+    renderQuickStats();
+});
+
+// Khởi chạy
+checkAuth();
