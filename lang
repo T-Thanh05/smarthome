@@ -1,0 +1,22 @@
+const dictionary = {
+    vi: {
+        title: "Nhà Thông Minh", header: "SMART HOME", subtitle: "Điều khiển ngôi nhà thông minh",
+        doors: "Cửa", mainDoor: "Cửa chính", garageDoor: "Cửa Gara", doorOpen: "Mở cửa", doorClosed: "Đóng cửa",
+        lights: "Đèn", livingRoom: "Phòng khách", kitchen: "Phòng bếp",
+        sensors: "Cảm Biến", humidity: "Độ ẩm", gas: "Khí Gas", safe: "An toàn", danger: "Nguy hiểm", temperature: "Nhiệt độ",
+        addDevice: "Thêm", addNewTitle: "Thêm thiết bị mới", save: "Lưu lại", cancel: "Hủy",
+        menuTitle: "Danh mục", menuDashboard: "Bảng điều khiển", menuSchedules: "Lịch hẹn giờ", menuScenes: "Ngữ cảnh", menuSettings: "Cài đặt", menuLogout: "Đăng xuất",
+        sceneLeaveDesc: "Tắt hết đèn, khóa tất cả cửa.", sceneSleepDesc: "Khóa cửa, tắt đèn, an tâm ngủ ngon.",
+        loginTitle: "Đăng Nhập"
+    },
+    en: {
+        title: "Smart Home", header: "SMART HOME", subtitle: "Smart Home Control System",
+        doors: "Doors", mainDoor: "Main Door", garageDoor: "Garage Door", doorOpen: "Open", doorClosed: "Closed",
+        lights: "Lights", livingRoom: "Living Room", kitchen: "Kitchen",
+        sensors: "Sensors", humidity: "Humidity", gas: "Gas", safe: "Safe", danger: "Danger", temperature: "Temperature",
+        addDevice: "Add", addNewTitle: "Add New Device", save: "Save", cancel: "Cancel",
+        menuTitle: "Menu", menuDashboard: "Dashboard", menuSchedules: "Schedules", menuScenes: "Scenes", menuSettings: "Settings", menuLogout: "Logout",
+        sceneLeaveDesc: "Turn off all lights, lock all doors.", sceneSleepDesc: "Lock doors, turn off lights, sleep well.",
+        loginTitle: "Login"
+    }
+};
