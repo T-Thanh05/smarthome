@@ -1,0 +1,265 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO
+import mysql.connector
+from mysql.connector import pooling
+import paho.mqtt.client as mqtt
+import os
+import time
+
+app = Flask(__name__, static_folder='../frontend', static_url_path='')
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+db_config = {
+
+}
+
+pool: pooling.MySQLConnectionPool = None
+
+def init_db():
+    global pool
+    try:
+        pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="mypool",
+            pool_size=5,
+            **db_config
+        )
+        print("✅ Đã kết nối thành công tới MySQL Database 'smart_home'")
+        
+        with pool.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    sensor_type VARCHAR(50),
+                    value VARCHAR(50),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        print("❌ LỖI KẾT NỐI MYSQL:", e)
+
+init_db()
+
+def get_conn():
+    return pool.get_connection()
+
+# --- CẤU HÌNH MQTT ---
+MQTT_BROKER = "broker.emqx.io"
+MQTT_PORT = 1883
+MQTT_TOPIC_PREFIX = "smarthome/device/"
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+# --- BỘ HÃM PHANH DB (Chống Lag) ---
+last_save_time = {'temperature': 0, 'humidity': 0, 'gas': 0}
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print("✅ Đã kết nối thành công tới Mosquitto MQTT Broker!")
+        client.subscribe("smarthome/sensor/#")
+    else:
+        print(f"❌ Lỗi kết nối MQTT Broker, mã lỗi: {rc}")
+
+def on_message(client, userdata, msg):
+    global last_save_time
+    topic = msg.topic
+    payload = msg.payload.decode()
+    
+    sensor_type = None
+    if "humidity" in topic: sensor_type = "humidity"
+    elif "temperature" in topic: sensor_type = "temperature"
+    elif "gas" in topic: sensor_type = "gas"
+
+    if sensor_type:
+        # 1. Bắn lên Web realtime (Số nhảy mượt mà ngay lập tức)
+        socketio.emit('sensor_update', {'type': sensor_type, 'value': payload})
+        
+        # 2. Hãm phanh: Cứ 60 giây mới mở Database ra lưu 1 lần
+        current_time = time.time()
+        if current_time - last_save_time.get(sensor_type, 0) >= 60:
+            try:
+                with get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("INSERT INTO sensor_logs (sensor_type, value) VALUES (%s, %s)", (sensor_type, payload))
+                    conn.commit()
+                last_save_time[sensor_type] = current_time 
+                print(f"💾 Đã lưu DB: {sensor_type} = {payload}")
+            except Exception as e:
+                print("Lỗi lưu DB:", e)
+
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message 
+
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print("❌ Không thể khởi động MQTT:", e)
+
+# --- KHU VỰC ĐỊNH TUYẾN WEB & API ---
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_frontend(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("SELECT * FROM sensor_logs ORDER BY timestamp DESC LIMIT 100")
+            rows = cur.fetchall()
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, role FROM users WHERE username = %s AND password = %s", (username, password))
+        row = cur.fetchone()
+    if row:
+        return jsonify(success=True, user=row)
+    return jsonify(success=False, message='Sai tài khoản hoặc mật khẩu!')
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO users (username, password, role) VALUES (%s, %s, 'user')", (username, password))
+            conn.commit()
+        return jsonify(success=True, message='Đăng ký thành công!')
+    except mysql.connector.Error as err:
+        if err.errno == mysql.connector.errorcode.ER_DUP_ENTRY:
+            return jsonify(success=False, message='Tên tài khoản này đã có người sử dụng!')
+        return jsonify(error=str(err)), 500
+
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
+    data = request.json
+    username = data.get('username')
+    new_password = data.get('newPassword')
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+        user = cur.fetchone()
+        if user:
+            cur.execute("UPDATE users SET password = %s WHERE username = %s", (new_password, username))
+            conn.commit()
+            return jsonify(success=True, message='Đặt lại mật khẩu thành công!')
+    return jsonify(success=False, message='Không tìm thấy tài khoản này!')
+
+@app.route('/api/change-password', methods=['POST'])
+def change_password():
+    data = request.json
+    username = data.get('username')
+    old_password = data.get('oldPassword')
+    new_password = data.get('newPassword')
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM users WHERE username = %s AND password = %s", (username, old_password))
+        user = cur.fetchone()
+        if user:
+            cur.execute("UPDATE users SET password = %s WHERE username = %s", (new_password, username))
+            conn.commit()
+            return jsonify(success=True, message='Đổi mật khẩu thành công!')
+    return jsonify(success=False, message='Mật khẩu cũ không chính xác!')
+
+@app.route('/api/users', methods=['GET'])
+def get_users():
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, role FROM users")
+        rows = cur.fetchall()
+    return jsonify(rows)
+
+@app.route('/api/users/<int:user_id>/role', methods=['PUT'])
+def update_role(user_id):
+    data = request.json
+    role = data.get('role')
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if user and user['username'].lower() == 'admin':
+            return jsonify(success=False, message='🛑 CẢNH BÁO: Không thể tước quyền của Admin gốc!')
+        cur.execute("UPDATE users SET role = %s WHERE id = %s", (role, user_id))
+        conn.commit()
+    return jsonify(success=True)
+
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if user and user['username'].lower() == 'admin':
+            return jsonify(success=False, message='🛑 CẢNH BÁO: Không thể xóa tài khoản Admin gốc!')
+        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        conn.commit()
+    return jsonify(success=True)
+
+@app.route('/api/devices', methods=['GET'])
+def get_devices():
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM devices")
+        rows = cur.fetchall()
+    return jsonify(rows)
+
+@app.route('/api/devices', methods=['POST'])
+def add_device():
+    data = request.json
+    name = data.get('name')
+    type_ = data.get('type')
+    device_id = f"{type_}_{int(time.time() * 1000)}"
+    state = 'CLOSED' if type_ == 'door' else 'OFF'
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO devices (id, name, type, state) VALUES (%s, %s, %s, %s)", (device_id, name, type_, state))
+        conn.commit()
+    socketio.emit('device_list_updated')
+    return jsonify(success=True)
+
+@app.route('/api/devices/<device_id>', methods=['DELETE'])
+def remove_device(device_id):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM devices WHERE id = %s", (device_id,))
+        conn.commit()
+    socketio.emit('device_list_updated')
+    return jsonify(success=True)
+
+@socketio.on('toggle_device')
+def handle_toggle_device(data):
+    device_id = data.get('id')
+    new_state = data.get('state')
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE devices SET state = %s WHERE id = %s", (new_state, device_id))
+            conn.commit()
+        socketio.emit('device_updated', data)
+        
+        topic = f"{MQTT_TOPIC_PREFIX}{device_id}"
+        mqtt_client.publish(topic, new_state)
+    except Exception as e:
+        print("Lỗi toggle_device:", e)
+
+if __name__ == '__main__':
+    app.debug = True
+    socketio.run(app, host='0.0.0.0', port=3000)
